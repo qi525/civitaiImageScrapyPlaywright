@@ -263,9 +263,12 @@ def parse_count_with_k(count_str):
             return 0
 
 # --- 核心爬虫流程 ---
-async def performCivitaiImageScrape(context, target_url):
-    async_name = asyncio.current_task().get_name()
-    # --- Cookie 注入 ---
+
+async def _navigate_and_setup_page(context, target_url, async_name):
+    """
+    负责页面导航和初始设置（如注入cookie）。
+    Returns: playwright.Page or None if navigation fails.
+    """
     try:
         if os.path.exists("cookies.json"):
             with open("cookies.json", "r", encoding="utf-8") as f:
@@ -288,10 +291,187 @@ async def performCivitaiImageScrape(context, target_url):
     try:
         logger.info(f"{async_name} -> Navigating to {target_url}")
         await page.goto(target_url, timeout=60000, wait_until="domcontentloaded")
+        # Add a short wait here to allow initial page content to render
+        await asyncio.sleep(2) # 等待2秒，让页面初步加载完成
         logger.info(f"{async_name} -> Successfully navigated to {target_url}")
+        return page
     except Exception as e:
         logger.error(f"{async_name} -> Error navigating to {target_url}: {e}")
         await page.close()
+        return None
+
+async def _extract_keyword(page, async_name):
+    """
+    负责从页面顶部输入框提取当前关键词。
+    Returns: str
+    """
+    # Refined selector to target the search input specifically
+    # Using first to resolve strict mode violation if multiple elements match
+    keyword_input_element = page.get_by_placeholder("Search Civitai").first
+    current_keyword = "N/A"
+    try:
+        # Check if the element is visible before trying to get its value
+        if await keyword_input_element.is_visible():
+            input_value = await keyword_input_element.get_attribute('value')
+            if input_value:
+                current_keyword = input_value
+                logger.info(f"{async_name} -> Found keyword in input field: '{current_keyword}'")
+    except playwright._impl._errors.Error as e:
+        logger.warning(f"{async_name} -> Could not find or extract keyword due to Playwright error: {e}")
+        # If it's a strict mode violation, try another more specific selector if possible
+        # Or log the specific locators that caused the issue.
+    except Exception as e:
+        logger.warning(f"{async_name} -> Could not find or extract keyword: {e}")
+    return current_keyword
+
+async def _scroll_page(page):
+    """
+    负责执行页面滚动操作。
+    """
+    await page.evaluate("""
+        document.querySelectorAll('*').forEach(function(el) {
+            if (el.scrollHeight > el.clientHeight) el.scrollTop += 40;
+        });
+    """)
+    #await asyncio.sleep(1) # 每次滚动后等待0.01秒，确保内容加载
+
+
+def _extract_button_counts(button): # Changed from async def to def
+    """
+    辅助函数：从单个按钮元素中提取点赞、爱心、笑哭、伤心和打赏的数量。
+    """
+    like_count = 0
+    heart_count = 0
+    laugh_count = 0
+    sad_count = 0
+    tip_count = 0
+
+    # Handle standard emoji buttons (like, heart, laugh, sad)
+    label_span = button.find("span", class_="mantine-Button-label")
+    if label_span:
+        emoji_div = label_span.find("div", class_="mantine-Text-root")
+        
+        # Get all text from the span and then try to extract the number
+        # This covers cases where the number is directly in the span, not in a separate div
+        full_label_text = label_span.get_text(separator=' ', strip=True)
+        
+        # Use regex to find digits (and possibly 'k' for thousands)
+        # [\d.]+ ensures we capture numbers like 1.2k, \d[\d\.]* ensures at least one digit and subsequent digits/dots
+        match = re.search(r'(\d[\d\.]*[kK]?)', full_label_text)
+        
+        count = 0
+        if match:
+            count_str = match.group(1)
+            count = parse_count_with_k(count_str)
+
+        if emoji_div: # Ensure emoji div exists
+            if "👍" in emoji_div.text:
+                like_count = count
+            elif "❤️" in emoji_div.text:
+                heart_count = count
+            elif "😂" in emoji_div.text:
+                laugh_count = count
+            elif "😢" in emoji_div.text:
+                sad_count = count
+    
+    # Special handling for the tip button (it's a badge, not a simple button label)
+    # This part remains unchanged as per your instruction
+    tip_badge = button.find("div", class_=lambda x: x and "mantine-Badge-root" in x)
+    if tip_badge:
+        # Check for the lightning bolt SVG
+        if tip_badge.find("svg", class_=lambda x: x and "tabler-icon-bolt" in x):
+            tip_text_div = tip_badge.find("div", class_="mantine-Text-root") # The count is in this div
+            if tip_text_div:
+                tip_str = tip_text_div.text.strip()
+                tip_count = parse_count_with_k(tip_str)
+
+    return like_count, heart_count, laugh_count, sad_count, tip_count
+
+
+async def _parse_card_container(card_container, base_image_folder_path, target_url, current_keyword, processed_image_detail_urls):
+    """
+    负责解析单个图片卡片容器，提取所有相关信息并下载图片。
+    Returns: dict or None if no valid data is extracted.
+    """
+    thumbnail_url = ""
+    original_page_url = ""
+    
+    # Extract thumbnail URL and original page URL
+    img_element = card_container.find("img", class_="EdgeImage_image__iH4_q")
+    if img_element:
+        thumbnail_url = img_element.get("src")
+        parent_a = img_element.find_parent("a")
+        if parent_a:
+            original_page_url = parent_a.get("href")
+            if original_page_url and not original_page_url.startswith("http"):
+                original_page_url = f"https://civitai.com{original_page_url}"
+
+    if not thumbnail_url or not thumbnail_url.startswith("http"):
+        return None
+
+    # De-duplication check
+    unique_key_for_scrape_tracking = thumbnail_url + "|" + original_page_url
+    if unique_key_for_scrape_tracking in processed_image_detail_urls:
+        return None # Already processed
+
+    processed_image_detail_urls.add(unique_key_for_scrape_tracking)
+
+    # --- Extract Button Counts ---
+    like_count = 0
+    heart_count = 0
+    laugh_count = 0
+    sad_count = 0
+    tip_count = 0
+
+    buttons_container = card_container.find("div", class_=lambda x: x and "flex items-center justify-center" in x and "p-2" in x and "gap-1" in x)
+    
+    if buttons_container:
+        buttons = buttons_container.find_all("button", class_=lambda x: x and ("mantine-UnstyledButton-root" in x or "mantine-Button-root" in x))
+        for button in buttons:
+            # Call _extract_button_counts as a regular function, not awaiting it
+            l, h, la, s, t = _extract_button_counts(button)
+            like_count += l
+            heart_count += h
+            laugh_count += la
+            sad_count += s
+            tip_count += t # Accumulate counts from all relevant buttons
+
+    # Download image (or skip if in history)
+    local_image_path, image_md5 = await process_image_data(thumbnail_url, original_page_url, base_image_folder_path)
+    if local_image_path:
+        abs_path = os.path.abspath(local_image_path)
+        if os.name == 'nt':
+            abs_path = abs_path.replace('\\', '/')
+            local_image_hyperlink = f"file:///{abs_path}"
+        else:
+            local_image_hyperlink = f"file://{abs_path}"
+    else:
+        local_image_hyperlink = ""
+    
+    result_data = {
+        "抓取时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "搜索URL": target_url,
+        "缩略图URL": thumbnail_url,
+        "本地缩略图路径": os.path.abspath(local_image_path) if local_image_path else "",
+        "本地缩略图超链接": local_image_hyperlink,
+        "原始图片详情页链接": original_page_url,
+        "点赞数": like_count,
+        "爱心数": heart_count,
+        "笑哭数": laugh_count,
+        "伤心数": sad_count,
+        "打赏数": tip_count,
+        "关键词": current_keyword
+    }
+    return result_data
+
+
+async def performCivitaiImageScrape(context, target_url):
+    # Declare local processed_image_detail_urls for this function's scope
+    processed_image_detail_urls_local = set() 
+    async_name = asyncio.current_task().get_name()
+    
+    page = await _navigate_and_setup_page(context, target_url, async_name)
+    if not page:
         return
 
     civitai_image_folder_path = os.path.join(IMAGE_DIR_BASE, "downloaded_images")
@@ -299,37 +479,21 @@ async def performCivitaiImageScrape(context, target_url):
         os.makedirs(civitai_image_folder_path)
         logger.info(f"{async_name} -> Created base image folder for Civitai: {civitai_image_folder_path}")
 
-    scrape_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    processed_image_detail_urls = set()  # 放在 while 循环外
-    scroll_attempts = 0
-    max_scroll_attempts = 80  # 原来是30，改为200，加大滚动次数
-    no_new_images_count = 0
-    no_new_images_start_time = None  # 新增：无新图片开始的时间
+    current_keyword = await _extract_keyword(page, async_name)
 
-    image_boxes_selector = '#main > div > div > div > main > div.z-10.m-0.flex-1.mantine-1avyp1d > div > div > div > div:nth-child(2) > div.mx-auto.flex.justify-center.gap-4'
-    keyword_input_selector = 'header input'  # 关键词输入框选择器
-    current_keyword = "N/A"
-    try:
-        keyword_input_element = page.locator(keyword_input_selector)
-        if await keyword_input_element.is_visible():
-            input_value = await keyword_input_element.get_attribute('value')
-            if input_value:
-                current_keyword = input_value
-                logger.info(f"{async_name} -> Found keyword in input field: '{current_keyword}'")
-    except Exception as e:
-        logger.warning(f"{async_name} -> Could not find or extract keyword: {e}")
+    scroll_attempts = 0
+    max_scroll_attempts = 80 # You can adjust this value to control how much to scroll
+    # Removed no_new_images_start_time and associated logic to stop scrolling based on new images
 
     while scroll_attempts < max_scroll_attempts:
         scroll_attempts += 1
         logger.info(f"{async_name} -> Scroll attempt {scroll_attempts}/{max_scroll_attempts}...")
-        await page.evaluate("""
-            document.querySelectorAll('*').forEach(function(el) {
-                if (el.scrollHeight > el.clientHeight) el.scrollTop += 40;
-            });
-        """)
-        #await asyncio.sleep(0.05)
+        await _scroll_page(page) #连续滚动五次
+        await _scroll_page(page) #连续滚动五次
+        await _scroll_page(page) #连续滚动五次
+        await _scroll_page(page) #连续滚动五次
+        await _scroll_page(page) #连续滚动五次
 
-        # 只抓取目标div下的img
         page_html = await page.content()
         soup = BeautifulSoup(page_html, "html.parser")
         target_div = soup.select_one("div.mx-auto.flex.justify-center.gap-4")
@@ -337,135 +501,30 @@ async def performCivitaiImageScrape(context, target_url):
             logger.warning("目标div未找到，跳过本次循环")
             continue
         
-        # Find all individual image card containers within the target_div
-        # Based on big big box.html and box.html, the main card container seems to be:
-        # <div class="relative flex overflow-hidden rounded-md ... flex-col border" id="...">
-        # or similar with class flex-col border and relative flex overflow-hidden
         image_card_containers = target_div.find_all("div", class_=lambda x: x and "flex-col border" in x and "relative flex overflow-hidden" in x)
 
-        newly_processed_this_scroll = 0
+        newly_processed_this_scroll = 0 # Still track for logging/visibility if needed, but not for stopping
         for card_container in image_card_containers:
-            thumbnail_url = ""
-            original_page_url = ""
-            
-            # Extract thumbnail URL and original page URL
-            img_element = card_container.find("img", class_="EdgeImage_image__iH4_q")
-            if img_element:
-                thumbnail_url = img_element.get("src")
-                parent_a = img_element.find_parent("a")
-                if parent_a:
-                    original_page_url = parent_a.get("href")
-                    if original_page_url and not original_page_url.startswith("http"):
-                        original_page_url = f"https://civitai.com{original_page_url}"
+            result = await _parse_card_container(card_container, civitai_image_folder_path, target_url, current_keyword, processed_image_detail_urls_local)
+            if result:
+                async with data_lock:
+                    all_search_results_data.append(result)
+                newly_processed_this_scroll += 1
+        
+        # Removed the logic that stopped scrolling if no new images were processed for a duration
+        # logger.info(f"{async_name} -> Processed {newly_processed_this_scroll} new images this scroll.") # Optional: add this for more detailed logs
 
-            if not thumbnail_url or not thumbnail_url.startswith("http"):
-                continue
-
-            # De-duplication check
-            unique_key_for_scrape_tracking = thumbnail_url + "|" + original_page_url
-            if unique_key_for_scrape_tracking in processed_image_detail_urls:
-                continue
-            processed_image_detail_urls.add(unique_key_for_scrape_tracking)
-            newly_processed_this_scroll += 1
-
-            # --- Extract Button Counts ---
-            like_count = 0
-            heart_count = 0
-            laugh_count = 0
-            sad_count = 0
-            tip_count = 0
-
-            # Find the div containing the buttons
-            # This seems to be <div class="flex items-center justify-center gap-1 justify-between p-2">
-            buttons_container = card_container.find("div", class_=lambda x: x and "flex items-center justify-center" in x and "p-2" in x and "gap-1" in x)
-            
-            if buttons_container:
-                # Find all buttons within this container
-                buttons = buttons_container.find_all("button", class_=lambda x: x and ("mantine-UnstyledButton-root" in x or "mantine-Button-root" in x))
-                for button in buttons:
-                    # Handle standard emoji buttons (like, heart, laugh, sad)
-                    label_span = button.find("span", class_="mantine-Button-label")
-                    if label_span:
-                        emoji_div = label_span.find("div", class_="mantine-Text-root")
-                        
-                        # Get all text from the span and then try to extract the number
-                        # This covers cases where the number is directly in the span, not in a separate div
-                        full_label_text = label_span.get_text(separator=' ', strip=True)
-                        
-                        # Use regex to find digits in the full_label_text
-                        match = re.search(r'(\d[\d\.]*[kK]?)', full_label_text)
-                        
-                        count = 0
-                        if match:
-                            count_str = match.group(1)
-                            count = parse_count_with_k(count_str)
-
-                        if emoji_div: # Ensure emoji div exists
-                            if "👍" in emoji_div.text:
-                                like_count = count
-                            elif "❤️" in emoji_div.text:
-                                heart_count = count
-                            elif "😂" in emoji_div.text:
-                                laugh_count = count
-                            elif "😢" in emoji_div.text:
-                                sad_count = count
-                    
-                    # Special handling for the tip button (it's a badge, not a simple button label)
-                    # This part remains unchanged as per your instruction
-                    tip_badge = button.find("div", class_=lambda x: x and "mantine-Badge-root" in x)
-                    if tip_badge:
-                        # Check for the lightning bolt SVG
-                        if tip_badge.find("svg", class_=lambda x: x and "tabler-icon-bolt" in x):
-                            tip_text_div = tip_badge.find("div", class_="mantine-Text-root") # The count is in this div
-                            if tip_text_div:
-                                tip_str = tip_text_div.text.strip()
-                                tip_count = parse_count_with_k(tip_str)
-
-            # Download image (or skip if in history)
-            local_image_path, image_md5 = await process_image_data(thumbnail_url, original_page_url, civitai_image_folder_path)
-            if local_image_path:
-                abs_path = os.path.abspath(local_image_path)
-                if os.name == 'nt':
-                    abs_path = abs_path.replace('\\', '/')
-                    local_image_hyperlink = f"file:///{abs_path}"
-                else:
-                    local_image_hyperlink = f"file://{abs_path}"
-            else:
-                local_image_hyperlink = ""
-            
-            result_data = {
-                "抓取时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "搜索URL": target_url,
-                "缩略图URL": thumbnail_url,
-                "本地缩略图路径": os.path.abspath(local_image_path) if local_image_path else "",
-                "本地缩略图超链接": local_image_hyperlink,
-                "原始图片详情页链接": original_page_url,
-                "点赞数": like_count,
-                "爱心数": heart_count,
-                "笑哭数": laugh_count,
-                "伤心数": sad_count,
-                "打赏数": tip_count,
-                "关键词": current_keyword
-            }
-            async with data_lock:
-                all_search_results_data.append(result_data)
-
-        if newly_processed_this_scroll == 0 and len(image_card_containers) > 0: # Check if any cards were found at all
-            if no_new_images_start_time is None:
-                no_new_images_start_time = time.time()
-            elapsed = time.time() - no_new_images_start_time
-            logger.info(f"{async_name} -> No new images processed this scroll. Consecutive no new images: {no_new_images_count}, elapsed: {elapsed:.1f}s")
-            if elapsed >= 20:
-                logger.info(f"{async_name} -> No new images for 20 seconds. Stopping scrolling.")
-                break
-        else:
-            no_new_images_start_time = None  # 有新图片就重置
     await page.close()
     logger.info(f"{async_name} -> Page closed for {target_url}.")
+
 
 # --- 主入口 ---
 all_search_results_data = []
 data_lock = asyncio.Lock()
+# Note: processed_image_detail_urls is now declared inside performCivitaiImageScrape
+# if you need to track across multiple performCivitaiImageScrape calls,
+# you might consider moving it to a global level or passing it as a parameter
+# to avoid re-initializing per scrape task. For now, it's reset per target_url.
 
 async def main():
     load_download_history(DOWNLOAD_HISTORY_FILE)
@@ -602,3 +661,6 @@ if __name__ == '__main__':
                 print(f"URL history Excel file not found: {HISTORY_IMG_URL_FILE}")
         except Exception as e:
             print(f"Error opening URL history Excel file {HISTORY_IMG_URL_FILE}: {e}")
+
+
+            #运行成功
