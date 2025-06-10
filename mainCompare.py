@@ -1,666 +1,689 @@
-# -*- coding: utf-8 -*-
-"""
-Civitai图片爬虫主流程：只用核心滚动代码，抓取所有图片信息并保存到Excel
-"""
-
+#
+# 功能模块和实现手法整理
+#
+# 本脚本旨在通过自动化浏览器（Playwright）抓取 Google 图片搜索结果页面的信息，
+# 包括每个搜索结果的图片、图片链接（原始图片URL）、关联网站的标题、关联网站链接和文字描述。
+# 抓取到的数据将与抓取时间戳、搜索关键词和搜索URL一同被整理并导出到Excel文件中。
+# 每个关键词的图片将保存到其专属的本地文件夹中，并在Excel中提供本地图片文件的绝对路径和可点击的超链接。
+# 脚本会保留原有的日志系统，自动打开日志和结果文件，并支持注入Cookies。
+#
+# --- 主要功能模块 ---
+#
+# 1. 配置管理 (Configuration):
+#    - PROXY: 定义HTTP代理地址，用于Playwright浏览器和httpx库的网络请求，规避地理限制或提高访问稳定性。
+#    - LOG_DIR, IMAGE_DIR_BASE, RESULTS_DIR: 定义日志文件、图片存储和Excel结果文件的输出目录。
+#    - KEYWORD_TARGET_FILE: 存储待搜索的关键词列表的文件。
+#    - 目录创建: 脚本启动时自动创建所需的日志、图片和结果目录，确保文件能正确保存。
+#    - 文件命名: 使用时间戳为日志和Excel文件生成唯一名称。
+#
+# 2. 日志系统 (Logging Setup):
+#    - 使用Python内置的 `logging` 模块，配置日志记录器 `google_scraper`。
+#    - 日志级别设置为 `INFO`，记录重要操作和信息。
+#    - 同时配置文件处理器 (`FileHandler`) 和控制台处理器 (`StreamHandler`)，实现日志同时输出到文件和控制台。
+#    - 日志格式化: 定义统一的日志输出格式。
+#    - 目的: 方便跟踪脚本运行状态、调试问题和记录抓取过程中的事件。
+#    - 自动打开日志: 脚本运行结束后，会自动尝试打开本次运行生成的日志文件。
+#
+# 3. 关键词读取 (Keyword Reading Helper Function - `read_keywords_from_file`):
+#    - 目的: 从 `keywordTarget.txt` 文件中读取待搜索的关键词列表。
+#    - 实现手法: 按行读取文件内容，每行视为一个关键词，并进行基本校验。
+#    - 优点: 提高脚本的灵活性和可配置性。
+#
+# 4. 浏览器自动化与数据抓取 (Browser Automation & Data Scraping - `performGoogleImageSearch`):
+#    - 核心模块，负责实际的网页交互和数据提取。
+#    - 异步操作: 使用 `asyncio` 和 `playwright.async_api` 实现异步并发抓取。
+#    - 浏览器上下文管理: 为每个抓取任务创建独立的浏览器上下文。
+#    - 注入 Cookies: 尝试从 `cookies.json` 文件中读取并注入 cookies，以维持会话状态。
+#    - 页面导航: 根据关键词构造Google图片搜索URL（`https://www.google.com/search?q=关键词&udm=2`）。
+#    - 动态内容加载: **已移除**之前Twitter脚本的滚动加载逻辑，Google图片搜索结果通常在一页显示。
+#    - 数据提取 (使用BeautifulSoup辅助):
+#      - 定位大的搜索结果元素 (`div.eA0Zlc`)。
+#      - 提取图片 (`.H8Rx8c img` 的 `src`)。
+#      - 提取标题和链接 (`a.EZAeBe`)。
+#      - 提取描述 (`div.toI8Rb`)。
+#    - 图片下载: 使用 `httpx` 异步下载图片，并保存到关键词对应的子文件夹中。
+#      - 文件命名: 使用时间戳和图片URL的SHA256哈希值，确保唯一性。
+#    - 数据存储: 将抓取到的数据（包括时间戳、关键词、搜索URL、图片链接、图片本地路径、标题、标题链接和描述）存储到全局列表 `all_search_results_data` 中。
+#    - 线程安全: 使用 `asyncio.Lock` 保护全局共享数据结构。
+#
+# 5. 主执行逻辑 (Main Execution Logic - `main`):
+#    - 启动Playwright浏览器，并设置固定的窗口分辨率。
+#    - 调用 `read_keywords_from_file` 获取所有目标关键词。
+#    - 为每个关键词创建 `performGoogleImageSearch` 任务，并并发执行。
+#    - 关闭浏览器实例。
+#
+# 6. Excel数据导出 (Excel Export Logic):
+#    - 使用 `openpyxl` 库创建新的Excel工作簿，并创建名为 "Google图片搜索结果" 的工作表。
+#    - 字段: "抓取时间", "搜索关键词", "搜索URL", "图片URL", "本地图片路径", "本地图片超链接", "搜索结果标题", "搜索结果标题链接", "搜索结果描述"。
+#    - 超链接处理: 为搜索URL、搜索结果标题链接和**本地图片超链接**添加可点击的超链接。
+#    - 列宽自适应: 根据列内容的最大长度自动调整列宽。
+#
+# 7. 脚本入口点 (Script Entry Point - `if __name__ == '__main__':`):
+#    - 运行主异步函数。
+#    - 错误处理: 捕获用户中断和所有未处理的异常，记录详细错误信息。
+#    - 清理和自动打开文件 (`finally` 块): 关闭所有日志处理器，并尝试自动打开生成的日志文件和Excel结果文件。
+#    - 兼容多操作系统: 自动判断操作系统并使用相应的命令打开文件。
+#
+# --- 技术栈 ---
+# - Python 3.x
+# - Playwright (异步浏览器自动化库)
+# - BeautifulSoup4 (HTML解析库)
+# - httpx (异步HTTP客户端，用于图片下载)
+# - openpyxl (Excel文件读写库)
+# - asyncio (Python异步编程框架)
+# - logging (Python内置日志模块)
+# - os, json, datetime, traceback, subprocess, hashlib (Python标准库)
+# - aiofiles (异步文件操作，用于保存图片)
+#
+# --- 运行环境要求 ---
+# - Python环境已安装。
+# - 确保已安装所需的Python库: `pip install playwright beautifulsoup4 openpyxl httpx aiofiles`
+# - 运行 `playwright install` 安装浏览器驱动。
+# - 需要一个 `keywordTarget.txt` 文件，其中包含要搜索的关键词，一行一个。
+# - **需要一个 `cookies.json` 文件，其中包含有效的 JSON 格式的 cookies 数据 (如果需要)。**
+# - 可选配置代理 (`PROXY` 变量)。
+#
+#
 import os
 import json
 import asyncio
-import aiohttp
+import aiohttp # Changed from httpx to aiohttp
 from datetime import datetime
 import traceback
 import logging
 import subprocess
-from openpyxl import Workbook, load_workbook
+from openpyxl import Workbook
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.hyperlink import Hyperlink
-import hashlib
-import aiofiles
-import re
+import hashlib # For creating unique filenames for images
+import aiofiles # For asynchronous file writing
+import base64 # Import base64 for data:image handling
+import re # Import re for regex to parse data:image
+
+# --- FIX FOR NameError: name 'playwright' is not defined ---
+# 导入 playwright.async_api 模块并为其创建一个别名，以便在异常处理时可以引用
+import playwright.async_api as playwright_api
+# 同时从 playwright.async_api 模块直接导入常用的函数和类
+from playwright.async_api import async_playwright, expect
+# --- END FIX ---
+
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
-import playwright._impl._errors
-import time
 
-# --- 配置 ---
-PROXY = "http://127.0.0.1:10808"
-TARGET_URL = "https://civitai.com/images?tags=4"
-LOG_DIR = "logs"
-RESULTS_DIR = "results_civitai"
-IMAGE_DIR_BASE = "images_civitai"
-KEYWORD_TARGET_FILE = "urlTarget.txt"
-DOWNLOAD_HISTORY_FILE = "download_history_civitai.json" # Original MD5-based history
-HISTORY_IMG_URL_FILE = "history_img_url_history.xlsx" # New URL/Path based history
 
+# --- Configuration ---
+PROXY = "http://127.0.0.1:10808" # Your proxy address
+LOG_DIR = "logs" # Directory for logs
+IMAGE_DIR_BASE = "images" # Base directory for images
+RESULTS_DIR = "results" # Directory for Excel results
+KEYWORD_TARGET_FILE = "keywordTarget.txt" # File to store target keywords
+DOWNLOAD_HISTORY_FILE = "download_history.json" # New: File to store download history for deduplication
+
+# Generate a timestamp for unique filenames - Moved to the top of the script for global access
 timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-log_filename = os.path.join(LOG_DIR, f"civitai_scraper_log_{timestamp}.txt")
-excel_filename = os.path.join(RESULTS_DIR, f"civitai_image_results_{timestamp}.xlsx")
+log_filename = os.path.join(LOG_DIR, f"image_scraper_log_{timestamp}.txt")
+excel_filename = os.path.join(RESULTS_DIR, f"google_image_results_{timestamp}.xlsx") # Excel filename with timestamp
 
-# --- 日志配置 ---
-logger = logging.getLogger('civitai_scraper')
-logger.setLevel(logging.INFO)
-if not os.path.exists(LOG_DIR):
-    os.makedirs(LOG_DIR)
-if not os.path.exists(RESULTS_DIR):
-    os.makedirs(RESULTS_DIR)
+
+# --- Logging Setup ---
+# Get logger instance
+logger = logging.getLogger('google_image_scraper') # Changed logger name
+logger.setLevel(logging.INFO) # Set minimum logging level to INFO
+
+# Create necessary directories if they don't exist
+# Moved directory creation before logging setup to ensure log directory exists
 if not os.path.exists(IMAGE_DIR_BASE):
-    os.makedirs(IMAGE_DIR_BASE)
+    os.mkdir(IMAGE_DIR_BASE)
+if not os.path.exists(LOG_DIR):
+    os.mkdir(LOG_DIR)
+if not os.path.exists(RESULTS_DIR):
+    os.mkdir(RESULTS_DIR)
+
+# Create file handler for logging to a file
 file_handler = logging.FileHandler(log_filename, encoding='utf-8')
+file_handler.setLevel(logging.INFO)
+
+# Create console handler for logging to console
 console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+
+# Define log message format
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(formatter)
 console_handler.setFormatter(formatter)
+
+# Add handlers to the logger
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
+# --- End Logging Setup ---
 
-# --- 工具函数 ---
+# Global list to store data for Excel export
+all_search_results_data = []
+# Lock for thread-safe access to all_search_results_data when multiple async tasks are running
+data_lock = asyncio.Lock()
+
+# Global dictionary to store download history: {identifier_hash: local_file_path}
+# For data:image, identifier_hash is content MD5.
+# For external URLs, identifier_hash is URL SHA256.
+# This will be loaded at the start and saved at the end to persist downloaded image hashes.
+download_history = {}
+
+
+# --- Helper function to calculate MD5 hash of bytes ---
 def calculate_md5(data_bytes):
+    """Calculates the MD5 hash of a given byte string."""
     return hashlib.md5(data_bytes).hexdigest()
 
-def calculate_url_md5(url):
-    """Calculates MD5 for a given URL string, used for consistent naming."""
-    return hashlib.md5(url.encode('utf-8')).hexdigest()
+# --- Helper function to calculate SHA256 hash of a string ---
+def calculate_sha256(data_string):
+    """Calculates the SHA256 hash of a given string (e.g., a URL)."""
+    return hashlib.sha256(data_string.encode('utf-8')).hexdigest()
 
-# Global history for MD5-based downloaded content
-download_history = {}
-# Global history for URL-based downloaded content (new)
-url_download_history = {}
-
+# --- Helper functions to load/save download history ---
 def load_download_history(filepath):
+    """Loads the download history from a JSON file."""
     global download_history
     if os.path.exists(filepath):
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 download_history = json.load(f)
             logger.info(f"Loaded download history from {filepath}")
+        except json.JSONDecodeError:
+            logger.warning(f"Warning: '{filepath}' contains invalid JSON. Starting with empty history.")
+            download_history = {} # Reset history if file is corrupted
         except Exception as e:
-            logger.warning(f"Failed to load download history (MD5): {e}")
-            download_history = {}
+            logger.error(f"Error loading download history from '{filepath}': {e}\n{traceback.format_exc()}")
+            download_history = {} # Reset history on other errors
     else:
         logger.info(f"Download history file '{filepath}' not found. Starting with empty history.")
         download_history = {}
 
 def save_download_history(filepath):
+    """Saves the current download history to a JSON file."""
     global download_history
     try:
-        dir_name = os.path.dirname(filepath)
-        if dir_name:
-            os.makedirs(dir_name, exist_ok=True)
+        # Ensure the directory for the history file exists
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
         with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(download_history, f, indent=4)
+            json.dump(download_history, f, indent=4) # Use indent for human-readable JSON
         logger.info(f"Saved download history to {filepath}")
     except Exception as e:
-        logger.error(f"Error saving download history (MD5) to '{filepath}': {e}\n{traceback.format_exc()}")
+        logger.error(f"Error saving download history to '{filepath}': {e}\n{traceback.format_exc()}")
 
-def load_url_history(filepath):
-    global url_download_history
-    if os.path.exists(filepath):
-        try:
-            wb = load_workbook(filepath)
-            ws = wb.active
-            header = [cell.value for cell in ws[1]]
-            for row_idx in range(2, ws.max_row + 1):
-                row_data = {header[col_idx]: ws.cell(row=row_idx, column=col_idx+1).value for col_idx in range(len(header))}
-                thumb_url = row_data.get("Thumbnail URL")
-                orig_page_url = row_data.get("Original Page URL")
-                local_path = row_data.get("Local Image Path")
-                if thumb_url and orig_page_url and local_path:
-                    # Using a combined key for uniqueness
-                    key = f"{thumb_url}|{orig_page_url}"
-                    url_download_history[key] = {
-                        "local_path": local_path,
-                        "image_md5": row_data.get("MD5 (Content)") # This might be useful for verification if needed
-                    }
-            logger.info(f"Loaded URL download history from {filepath}")
-        except Exception as e:
-            logger.warning(f"Failed to load URL download history from {filepath}: {e}")
-            url_download_history = {}
-    else:
-        logger.info(f"URL download history file '{filepath}' not found. Starting with empty history.")
-        url_download_history = {}
-
-def save_url_history(filepath):
-    global url_download_history
-    try:
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Image Download History"
-        headers = ["Thumbnail URL", "Original Page URL", "Local Image Path", "MD5 (Content)"]
-        ws.append(headers)
-
-        for key, data in url_download_history.items():
-            thumb_url, orig_page_url = key.split('|', 1) # Split only on the first '|'
-            ws.append([thumb_url, orig_page_url, data["local_path"], data.get("image_md5", "")])
-
-        for col_idx, header in enumerate(headers):
-            max_length = len(header)
-            column_letter = get_column_letter(col_idx + 1)
-            for r_idx in range(1, ws.max_row + 1):
-                cell_value = ws.cell(row=r_idx, column=col_idx + 1).value
-                if cell_value:
-                    cell_len = len(str(cell_value))
-                    if cell_len > max_length:
-                        max_length = cell_len
-            adjusted_width = (max_length + 2) * 1.2
-            if adjusted_width > 100:
-                adjusted_width = 100
-            ws.column_dimensions[column_letter].width = adjusted_width
-
-        wb.save(filepath)
-        logger.info(f"Saved URL download history to {filepath}")
-    except Exception as e:
-        logger.error(f"Error saving URL download history to '{filepath}': {e}\n{traceback.format_exc()}")
-
-def read_urls_from_file(filepath):
-    urls = []
+# --- New helper function to read Keywords from file ---
+def read_keywords_from_file(filepath):
+    """Reads keywords from a text file, one keyword per line."""
+    keywords = []
     if not os.path.exists(filepath):
-        logger.error(f"Error: Target URL file '{filepath}' not found. 请创建并添加URL。")
+        logger.error(f"Error: Keyword target file '{filepath}' not found. Please create it with one keyword per line.")
         return []
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             for line in f:
-                url = line.strip()
-                if url and url.startswith("http"):
-                    urls.append(url)
-        if not urls:
-            logger.warning(f"Warning: Target URL file '{filepath}' is empty or contains no valid URLs.")
-        return urls
+                keyword = line.strip()
+                if keyword: # Basic validation for non-empty keyword
+                    keywords.append(keyword)
+        if not keywords:
+            logger.warning(f"Warning: Keyword target file '{filepath}' is empty or contains no valid keywords.")
+        return keywords
     except Exception as e:
-        logger.error(f"Error reading URLs from '{filepath}': {e}\n{traceback.format_exc()}")
+        logger.error(f"Error reading keywords from '{filepath}': {e}\n{traceback.format_exc()}")
         return []
+# --- End new helper function ---
 
-async def process_image_data(image_url, original_page_url, base_folder_path):
+
+async def process_image_data(image_url, keyword_folder_path, async_name):
+    """
+    Processes an image URL (external or data:image), handles deduplication,
+    downloads if necessary, and returns the local file path and the identifier hash.
+    For external URLs, deduplication is based on URL hash to avoid re-downloading.
+    For data:image, deduplication is based on content MD5.
+    """
     local_filename = None
-    image_content_md5 = None
-    image_bytes = None
+    identifier_hash = None # This will be either content MD5 or URL SHA256
 
     if not image_url:
-        logger.warning("Empty image URL skipped.")
+        logger.warning(f"{async_name} -> Empty image URL skipped.")
         return None, None
 
-    # Determine file extension
-    url_without_query = image_url.split('?')[0]
-    file_extension = url_without_query.split('.')[-1].lower()
-    if not file_extension or len(file_extension) > 5 or not file_extension.isalpha():
-        file_extension = 'jpg'
+    # Handle data:image (Base64 encoded image directly in the URL)
+    if image_url.startswith('data:image/'):
+        # Regular expression to extract content type and base64 data
+        match = re.match(r'data:image/(?P<ext>[^;]+);base64,(?P<data>.+)', image_url)
+        if not match:
+            logger.warning(f"{async_name} -> Invalid data:image format encountered: {image_url[:100]}...")
+            return None, None
 
-    # Create a unique key for the URL history
-    unique_url_key = f"{image_url}|{original_page_url}"
+        extension = match.group('ext') # e.g., 'png', 'jpeg'
+        base64_data = match.group('data') # The actual base64 encoded string
 
-    # --- Step 1: Check URL/Path history first to avoid re-downloading ---
-    if unique_url_key in url_download_history:
-        existing_info = url_download_history[unique_url_key]
-        existing_path = existing_info["local_path"]
-        
-        # Infer the expected filename based on how we name files (MD5 of content, if available)
-        # If we have an MD5 from history, we can assume the filename.
-        expected_filename_from_history_md5 = None
-        if existing_info.get("image_md5"):
-            expected_filename_from_history_md5 = os.path.join(base_folder_path, f"{existing_info['image_md5']}.{file_extension}")
-        else:
-            # If MD5 not in history, but we have a path, try to derive from path
-            # This is a fallback if the MD5 was missing in the history record itself.
-            expected_filename_from_history_md5 = existing_path # In this case, we just check if the path itself is valid
-
-        if os.path.exists(existing_path) and (not expected_filename_from_history_md5 or os.path.basename(existing_path) == os.path.basename(expected_filename_from_history_md5)):
-            # Log the skip with the relevant info
-            logger.info(f"Image '{image_url}' found in history with local path '{existing_path}'. File exists and name matches. Skipping download and content MD5 calculation.")
-            return existing_path, existing_info.get("image_md5") # Return the MD5 from history
-
-    # --- Step 2: If not in URL history or file missing, proceed to download and calculate MD5 ---
-    if image_url.startswith('http'):
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(image_url, proxy=PROXY if PROXY else None, timeout=30.0) as response:
-                    response.raise_for_status()
-                    image_bytes = await response.read()
-                    image_content_md5 = calculate_md5(image_bytes) # Calculate MD5 only for new downloads
+            # Decode the base64 data into bytes
+            image_bytes = base64.b64decode(base64_data)
+            # Calculate MD5 hash of the decoded image content for deduplication
+            identifier_hash = calculate_md5(image_bytes) # Use content MD5 for data:image
 
-                    # Check the original MD5-based download history (secondary check for content de-duplication)
-                    if image_content_md5 in download_history:
-                        existing_path = download_history[image_content_md5]
-                        if os.path.exists(existing_path):
-                            logger.info(f"Downloaded image content (MD5: {image_content_md5}) already exists at: {existing_path}. Skipping save and using existing path.")
-                            # Update URL history with this path, even if found via MD5 history
-                            url_download_history[unique_url_key] = {"local_path": existing_path, "image_md5": image_content_md5}
-                            return existing_path, image_content_md5
+            # Check if this image content (by MD5 hash) has been downloaded before
+            if identifier_hash in download_history:
+                existing_path = download_history[identifier_hash]
+                # Verify that the file actually exists on disk (cleanup in case history is stale)
+                if os.path.exists(existing_path):
+                    logger.info(f"{async_name} -> Data:image content (MD5: {identifier_hash}) already exists at: {existing_path}. Skipping save.")
+                    return existing_path, identifier_hash # Return existing path and MD5
+                else:
+                    logger.warning(f"{async_name} -> Data:image content (MD5: {identifier_hash}) found in history but file missing at {existing_path}. Re-downloading.")
+                    # If file is missing, remove from history to attempt re-download/save
+                    del download_history[identifier_hash]
 
-                    local_filename = os.path.join(base_folder_path, f"{image_content_md5}.{file_extension}")
-                    os.makedirs(os.path.dirname(local_filename), exist_ok=True)
-                    async with aiofiles.open(local_filename, 'wb') as f:
-                        await f.write(image_bytes)
-                    logger.info(f"Image downloaded and saved: {local_filename}")
 
-                    # Update both histories
-                    download_history[image_content_md5] = local_filename
-                    url_download_history[unique_url_key] = {"local_path": local_filename, "image_md5": image_content_md5}
-                    return local_filename, image_content_md5
+            # If not in history or file missing, save the image locally
+            # Use the content MD5 as part of the filename to ensure uniqueness and traceability
+            local_filename = os.path.join(keyword_folder_path, f"{identifier_hash}.{extension.lower()}")
+
+            # Ensure the target directory exists before writing the file
+            os.makedirs(os.path.dirname(local_filename), exist_ok=True)
+            async with aiofiles.open(local_filename, 'wb') as f:
+                await f.write(image_bytes)
+            logger.info(f"{async_name} -> Data:image saved locally: {local_filename}")
+
+            # Update the global download history with the new image's content MD5 and its path
+            download_history[identifier_hash] = local_filename
+            return local_filename, identifier_hash
+
         except Exception as e:
-            logger.error(f"Error downloading image {image_url}: {e}")
-    else:
-        logger.warning(f"Unsupported image URL format (not http/https): {image_url[:100]}...")
-    return None, None
+            logger.error(f"{async_name} -> Error processing data:image: {e}\n{traceback.format_exc()}")
+            return None, None
 
-# Helper to parse counts with 'k'
-def parse_count_with_k(count_str):
-    if not count_str:
-        return 0
-    count_str = count_str.strip().lower()
-    if 'k' in count_str:
+    # Handle external image URL (http/https)
+    elif image_url.startswith('http'):
+        # For external URLs, we will use the URL's SHA256 hash as the primary identifier for deduplication
+        # This allows us to skip downloading if the specific URL has been processed before.
+        identifier_hash = calculate_sha256(image_url) # Use URL SHA256 for external URLs
+
+        # Determine a predictable local filename based on the URL's SHA256 hash
+        url_without_query = image_url.split('?')[0]
+        file_extension = url_without_query.split('.')[-1].lower()
+        if not file_extension or len(file_extension) > 5 or not file_extension.isalpha():
+            file_extension = 'jpg' # Default to jpg if no clear or valid extension
+        
+        # This is the expected path if the file were downloaded from this URL
+        local_filename_from_url = os.path.join(keyword_folder_path, f"{identifier_hash}.{file_extension}")
+
+        # === Deduplication Check: Check if this URL has been downloaded before ===
+        if identifier_hash in download_history:
+            existing_path = download_history[identifier_hash]
+            # Crucially, check if the file still exists at the recorded path
+            if os.path.exists(existing_path):
+                logger.info(f"{async_name} -> Image from URL (SHA256: {identifier_hash}) already downloaded at: {existing_path}. Skipping download.")
+                return existing_path, identifier_hash # Return existing path and URL SHA256
+            else:
+                logger.warning(f"{async_name} -> Image from URL (SHA256: {identifier_hash}) found in history but file missing at {existing_path}. Re-downloading.")
+                # If the file is missing, remove from history so we attempt to re-download
+                del download_history[identifier_hash]
+
+        # If not in history or file is missing, proceed to download
         try:
-            return int(float(count_str.replace('k', '')) * 1000)
-        except ValueError:
-            return 0
+            connector = None
+            if PROXY:
+                # If you experience SSL verification issues with your proxy, you might uncomment the line below:
+                # connector = aiohttp.TCPConnector(ssl=False)
+                pass
+
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.get(image_url, proxy=PROXY if PROXY else None, timeout=30.0) as response:
+                    response.raise_for_status() # Raise an exception for HTTP errors (4xx or 5xx)
+                    image_bytes = await response.read() # Read the entire image content into memory
+
+                    # Ensure the directory for the specific image exists before writing the file
+                    os.makedirs(os.path.dirname(local_filename_from_url), exist_ok=True)
+
+                    async with aiofiles.open(local_filename_from_url, 'wb') as f:
+                        await f.write(image_bytes)
+                    logger.info(f"{async_name} -> Image downloaded: {local_filename_from_url}")
+
+                    # Update the global download history with the URL's SHA256 and its local path
+                    download_history[identifier_hash] = local_filename_from_url
+                    return local_filename_from_url, identifier_hash
+
+        except aiohttp.ClientResponseError as e:
+            logger.error(f"{async_name} -> HTTP error {e.status} downloading image {image_url}: {e.message}")
+        except aiohttp.ClientConnectorError as e:
+            logger.error(f"{async_name} -> Network error (ClientConnectorError) downloading image {image_url}: {e}")
+        except asyncio.TimeoutError:
+            logger.error(f"{async_name} -> Timeout error downloading image {image_url}")
+        except Exception as e:
+            logger.error(f"{async_name} -> Unexpected error downloading image {image_url}: {e}\n{traceback.format_exc()}")
     else:
-        try:
-            # Use regex to find only digits (and possibly a dot for k)
-            match = re.search(r'[\d.]+', count_str)
-            if match:
-                return int(float(match.group(0)))
-            return 0
-        except ValueError:
-            return 0
+        logger.warning(f"{async_name} -> Unsupported image URL format (not http/https or data:image): {image_url[:100]}...")
 
-# --- 核心爬虫流程 ---
+    return None, None # Return None if any error or unhandled format
 
-async def _navigate_and_setup_page(context, target_url, async_name):
-    """
-    负责页面导航和初始设置（如注入cookie）。
-    Returns: playwright.Page or None if navigation fails.
-    """
+
+async def performGoogleImageSearch(context, keyword): # Renamed function
+    # Get the name of the current asynchronous task
+    async_name = asyncio.current_task().get_name()
+
+    # Construct the Google image search URL
+    search_url = f"https://www.google.com/search?q={keyword}&udm=2" # udm=2 for image search
+
+    # --- 重新启用: 加载并添加 cookies 到浏览器上下文 ---
     try:
         if os.path.exists("cookies.json"):
             with open("cookies.json", "r", encoding="utf-8") as f:
                 cookies = json.load(f)
                 for cookie in cookies:
+                    # Playwright expects 'sameSite' to be 'Strict', 'Lax', or 'None'
+                    # Ensure the value is correctly mapped or removed if invalid
                     cookie_same_site = {'strict': 'Strict', 'Lax': 'Lax', 'none': 'None'}.get(cookie.get('sameSite'), None)
                     if cookie_same_site in ['Strict', 'Lax', 'None']:
                         cookie['sameSite'] = cookie_same_site
                     else:
                         if 'sameSite' in cookie:
-                            del cookie['sameSite']
+                            del cookie['sameSite'] # Remove invalid sameSite attribute
                 await context.add_cookies(cookies)
             logger.info(f"{async_name} -> Cookies loaded and added to context.")
         else:
-            logger.warning(f"{async_name} -> Warning: cookies.json not found. Proceeding without cookies.")
+            logger.warning(f"{async_name} -> Warning: cookies.json not found. Proceeding without cookies. Please ensure 'cookies.json' exists if needed.")
+    except json.JSONDecodeError:
+        logger.error(f"{async_name} -> Error: Invalid JSON in cookies.json. Please check the file format. Full traceback:\n{traceback.format_exc()}")
+        # return # Optionally return here if cookies are critical for the page to load correctly
     except Exception as e:
-        logger.error(f"{async_name} -> Error loading cookies: {e}")
+        logger.error(f"{async_name} -> Unexpected error loading cookies: {e}\n{traceback.format_exc()}")
+        # return # Optionally return here if cookies are critical for the page to load correctly
+    # --- 重新启用结束 ---
 
+    # Create a new page in the browser context
     page = await context.new_page()
+
     try:
-        logger.info(f"{async_name} -> Navigating to {target_url}")
-        await page.goto(target_url, timeout=60000, wait_until="domcontentloaded")
-        # Add a short wait here to allow initial page content to render
-        await asyncio.sleep(2) # 等待2秒，让页面初步加载完成
-        logger.info(f"{async_name} -> Successfully navigated to {target_url}")
-        return page
-    except Exception as e:
-        logger.error(f"{async_name} -> Error navigating to {target_url}: {e}")
+        # Navigate to the Google search URL, with a timeout
+        logger.info(f"{async_name} -> Navigating to {search_url}")
+        await page.goto(search_url, timeout=60000, wait_until="domcontentloaded") # Use domcontentloaded for faster loading
+        logger.info(f"{async_name} -> Successfully navigated to {search_url}")
+    except playwright_api.TimeoutError:
+        logger.error(f"{async_name} -> Error: Page.goto timed out for {search_url} after 60 seconds. Check network or proxy.")
         await page.close()
-        return None
-
-async def _extract_keyword(page, async_name):
-    """
-    负责从页面顶部输入框提取当前关键词。
-    Returns: str
-    """
-    # Refined selector to target the search input specifically
-    # Using first to resolve strict mode violation if multiple elements match
-    keyword_input_element = page.get_by_placeholder("Search Civitai").first
-    current_keyword = "N/A"
-    try:
-        # Check if the element is visible before trying to get its value
-        if await keyword_input_element.is_visible():
-            input_value = await keyword_input_element.get_attribute('value')
-            if input_value:
-                current_keyword = input_value
-                logger.info(f"{async_name} -> Found keyword in input field: '{current_keyword}'")
-    except playwright._impl._errors.Error as e:
-        logger.warning(f"{async_name} -> Could not find or extract keyword due to Playwright error: {e}")
-        # If it's a strict mode violation, try another more specific selector if possible
-        # Or log the specific locators that caused the issue.
+        return
     except Exception as e:
-        logger.warning(f"{async_name} -> Could not find or extract keyword: {e}")
-    return current_keyword
-
-async def _scroll_page(page):
-    """
-    负责执行页面滚动操作。
-    """
-    await page.evaluate("""
-        document.querySelectorAll('*').forEach(function(el) {
-            if (el.scrollHeight > el.clientHeight) el.scrollTop += 40;
-        });
-    """)
-    #await asyncio.sleep(1) # 每次滚动后等待0.01秒，确保内容加载
-
-
-def _extract_button_counts(button): # Changed from async def to def
-    """
-    辅助函数：从单个按钮元素中提取点赞、爱心、笑哭、伤心和打赏的数量。
-    """
-    like_count = 0
-    heart_count = 0
-    laugh_count = 0
-    sad_count = 0
-    tip_count = 0
-
-    # Handle standard emoji buttons (like, heart, laugh, sad)
-    label_span = button.find("span", class_="mantine-Button-label")
-    if label_span:
-        emoji_div = label_span.find("div", class_="mantine-Text-root")
-        
-        # Get all text from the span and then try to extract the number
-        # This covers cases where the number is directly in the span, not in a separate div
-        full_label_text = label_span.get_text(separator=' ', strip=True)
-        
-        # Use regex to find digits (and possibly 'k' for thousands)
-        # [\d.]+ ensures we capture numbers like 1.2k, \d[\d\.]* ensures at least one digit and subsequent digits/dots
-        match = re.search(r'(\d[\d\.]*[kK]?)', full_label_text)
-        
-        count = 0
-        if match:
-            count_str = match.group(1)
-            count = parse_count_with_k(count_str)
-
-        if emoji_div: # Ensure emoji div exists
-            if "👍" in emoji_div.text:
-                like_count = count
-            elif "❤️" in emoji_div.text:
-                heart_count = count
-            elif "😂" in emoji_div.text:
-                laugh_count = count
-            elif "😢" in emoji_div.text:
-                sad_count = count
-    
-    # Special handling for the tip button (it's a badge, not a simple button label)
-    # This part remains unchanged as per your instruction
-    tip_badge = button.find("div", class_=lambda x: x and "mantine-Badge-root" in x)
-    if tip_badge:
-        # Check for the lightning bolt SVG
-        if tip_badge.find("svg", class_=lambda x: x and "tabler-icon-bolt" in x):
-            tip_text_div = tip_badge.find("div", class_="mantine-Text-root") # The count is in this div
-            if tip_text_div:
-                tip_str = tip_text_div.text.strip()
-                tip_count = parse_count_with_k(tip_str)
-
-    return like_count, heart_count, laugh_count, sad_count, tip_count
-
-
-async def _parse_card_container(card_container, base_image_folder_path, target_url, current_keyword, processed_image_detail_urls):
-    """
-    负责解析单个图片卡片容器，提取所有相关信息并下载图片。
-    Returns: dict or None if no valid data is extracted.
-    """
-    thumbnail_url = ""
-    original_page_url = ""
-    
-    # Extract thumbnail URL and original page URL
-    img_element = card_container.find("img", class_="EdgeImage_image__iH4_q")
-    if img_element:
-        thumbnail_url = img_element.get("src")
-        parent_a = img_element.find_parent("a")
-        if parent_a:
-            original_page_url = parent_a.get("href")
-            if original_page_url and not original_page_url.startswith("http"):
-                original_page_url = f"https://civitai.com{original_page_url}"
-
-    if not thumbnail_url or not thumbnail_url.startswith("http"):
-        return None
-
-    # De-duplication check
-    unique_key_for_scrape_tracking = thumbnail_url + "|" + original_page_url
-    if unique_key_for_scrape_tracking in processed_image_detail_urls:
-        return None # Already processed
-
-    processed_image_detail_urls.add(unique_key_for_scrape_tracking)
-
-    # --- Extract Button Counts ---
-    like_count = 0
-    heart_count = 0
-    laugh_count = 0
-    sad_count = 0
-    tip_count = 0
-
-    buttons_container = card_container.find("div", class_=lambda x: x and "flex items-center justify-center" in x and "p-2" in x and "gap-1" in x)
-    
-    if buttons_container:
-        buttons = buttons_container.find_all("button", class_=lambda x: x and ("mantine-UnstyledButton-root" in x or "mantine-Button-root" in x))
-        for button in buttons:
-            # Call _extract_button_counts as a regular function, not awaiting it
-            l, h, la, s, t = _extract_button_counts(button)
-            like_count += l
-            heart_count += h
-            laugh_count += la
-            sad_count += s
-            tip_count += t # Accumulate counts from all relevant buttons
-
-    # Download image (or skip if in history)
-    local_image_path, image_md5 = await process_image_data(thumbnail_url, original_page_url, base_image_folder_path)
-    if local_image_path:
-        abs_path = os.path.abspath(local_image_path)
-        if os.name == 'nt':
-            abs_path = abs_path.replace('\\', '/')
-            local_image_hyperlink = f"file:///{abs_path}"
-        else:
-            local_image_hyperlink = f"file://{abs_path}"
-    else:
-        local_image_hyperlink = ""
-    
-    result_data = {
-        "抓取时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "搜索URL": target_url,
-        "缩略图URL": thumbnail_url,
-        "本地缩略图路径": os.path.abspath(local_image_path) if local_image_path else "",
-        "本地缩略图超链接": local_image_hyperlink,
-        "原始图片详情页链接": original_page_url,
-        "点赞数": like_count,
-        "爱心数": heart_count,
-        "笑哭数": laugh_count,
-        "伤心数": sad_count,
-        "打赏数": tip_count,
-        "关键词": current_keyword
-    }
-    return result_data
-
-
-async def performCivitaiImageScrape(context, target_url):
-    # Declare local processed_image_detail_urls for this function's scope
-    processed_image_detail_urls_local = set() 
-    async_name = asyncio.current_task().get_name()
-    
-    page = await _navigate_and_setup_page(context, target_url, async_name)
-    if not page:
+        logger.error(f"{async_name} -> An unexpected error occurred during navigation to {search_url}: {e}")
+        await page.close()
         return
 
-    civitai_image_folder_path = os.path.join(IMAGE_DIR_BASE, "downloaded_images")
-    if not os.path.exists(civitai_image_folder_path):
-        os.makedirs(civitai_image_folder_path)
-        logger.info(f"{async_name} -> Created base image folder for Civitai: {civitai_image_folder_path}")
+    # Create keyword-specific image folder
+    keyword_folder_name = keyword.replace(" ", "_").replace("/", "_").replace("\\", "_") # Sanitize keyword for folder name
+    keyword_folder_path = os.path.join(IMAGE_DIR_BASE, keyword_folder_name)
+    if not os.path.exists(keyword_folder_path):
+        os.makedirs(keyword_folder_path)
+        logger.info(f"{async_name} -> Created image folder: {keyword_folder_path}")
 
-    current_keyword = await _extract_keyword(page, async_name)
+    # Get the current timestamp for when the data was scraped
+    scrape_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    scroll_attempts = 0
-    max_scroll_attempts = 80 # You can adjust this value to control how much to scroll
-    # Removed no_new_images_start_time and associated logic to stop scrolling based on new images
+    try:
+        # Locate all large search result elements using div.eA0Zlc
+        # 等待至少一个搜索结果元素出现
+        await expect(page.locator('div.eA0Zlc').nth(0)).to_be_visible(timeout=30000)
+        search_results_divs = page.locator('div.eA0Zlc')
+        result_count = await search_results_divs.count()
+        logger.info(f"{async_name} -> Found {result_count} search results for keyword: '{keyword}'")
 
-    while scroll_attempts < max_scroll_attempts:
-        scroll_attempts += 1
-        logger.info(f"{async_name} -> Scroll attempt {scroll_attempts}/{max_scroll_attempts}...")
-        await _scroll_page(page) #连续滚动五次
-        await _scroll_page(page) #连续滚动五次
-        await _scroll_page(page) #连续滚动五次
-        await _scroll_page(page) #连续滚动五次
-        await _scroll_page(page) #连续滚动五次
+        if result_count == 0:
+            logger.warning(f"{async_name} -> No search results found for keyword: '{keyword}'.")
 
-        page_html = await page.content()
-        soup = BeautifulSoup(page_html, "html.parser")
-        target_div = soup.select_one("div.mx-auto.flex.justify-center.gap-4")
-        if not target_div:
-            logger.warning("目标div未找到，跳过本次循环")
-            continue
-        
-        image_card_containers = target_div.find_all("div", class_=lambda x: x and "flex-col border" in x and "relative flex overflow-hidden" in x)
+        for i in range(result_count):
+            result_data = {
+                "抓取时间": scrape_timestamp,
+                "搜索关键词": keyword,
+                "搜索URL": search_url,
+                "图片URL": "",
+                "本地图片路径": "",
+                "本地图片超链接": "",
+                "搜索结果标题": "",
+                "搜索结果标题链接": "",
+                "搜索结果描述": ""
+            }
+            try:
+                current_result_div = search_results_divs.nth(i)
+                # Ensure the current search result div is visible before interacting with it
+                await expect(current_result_div).to_be_visible(timeout=10000)
 
-        newly_processed_this_scroll = 0 # Still track for logging/visibility if needed, but not for stopping
-        for card_container in image_card_containers:
-            result = await _parse_card_container(card_container, civitai_image_folder_path, target_url, current_keyword, processed_image_detail_urls_local)
-            if result:
-                async with data_lock:
-                    all_search_results_data.append(result)
-                newly_processed_this_scroll += 1
-        
-        # Removed the logic that stopped scrolling if no new images were processed for a duration
-        # logger.info(f"{async_name} -> Processed {newly_processed_this_scroll} new images this scroll.") # Optional: add this for more detailed logs
+                # Get the inner HTML of the current search result div for BeautifulSoup parsing
+                soup = BeautifulSoup(await current_result_div.inner_html(timeout=10000), "html.parser")
 
-    await page.close()
-    logger.info(f"{async_name} -> Page closed for {target_url}.")
+                # Extract image URL
+                # Prioritize 'data-src' if available, then fallback to 'src'
+                image_element = soup.select_one('.H8Rx8c img')
+                image_url = image_element.get('data-src') or image_element.get('src') if image_element else ""
+                result_data["图片URL"] = image_url
+
+                # Process image data (download or use from history)
+                if image_url:
+                    # Call the process_image_data function to handle both types of URLs and deduplication
+                    local_image_path, identifier_hash_used = await process_image_data(image_url, keyword_folder_path, async_name)
+                    if local_image_path:
+                        result_data["本地图片路径"] = os.path.abspath(local_image_path) # Absolute path
+                        # For Excel hyperlink, prepend file:/// if on Windows, or just path
+                        if os.name == 'nt':
+                            # Pre-format the path to avoid backslash issue in f-string
+                            formatted_local_path = result_data['本地图片路径'].replace('\\', '/')
+                            result_data["本地图片超链接"] = f"file:///{formatted_local_path}"
+                        else:
+                            result_data["本地图片超链接"] = f"file://{result_data['本地图片路径']}"
+
+                # Extract title and title link (a.EZAeBe)
+                title_element = soup.select_one('a.EZAeBe')
+                if title_element:
+                    result_data["搜索结果标题"] = title_element.get_text(strip=True)
+                    result_data["搜索结果标题链接"] = title_element.get('href')
+                else:
+                    logger.warning(f"{async_name} -> Skipping result {i+1} for keyword '{keyword}': No title element (a.EZAeBe) found.")
+                    # Continue processing, title might not always be present for images
+
+                # Extract description (div.toI8Rb)
+                description_element = soup.select_one('div.toI8Rb')
+                if description_element:
+                    result_data["搜索结果描述"] = description_element.get_text(separator="\n", strip=True)
+                # else: description can be empty, not a critical error.
+
+                logger.info(f"{async_name} -> {'=' * 30}")
+                logger.info(f"{async_name} -> Keyword: '{keyword}', Result {i+1}/{result_count}.")
+                logger.info(f"{async_name} -> Image URL: {result_data['图片URL']}")
+                logger.info(f"{async_name} -> Local Image Path: {result_data['本地图片路径']}")
+                logger.info(f"{async_name} -> Title: {result_data['搜索结果标题']}")
+                logger.info(f"{async_name} -> Title Link: {result_data['搜索结果标题链接']}")
+                logger.info(f"{async_name} -> Description: {result_data['搜索结果描述']}")
+
+                async with data_lock: # Acquire lock before modifying shared list
+                    all_search_results_data.append(result_data)
+
+            except (playwright_api.TimeoutError, AssertionError) as e:
+                logger.warning(f"{async_name} -> Playwright Locator Error for search result {i+1} for keyword '{keyword}': {e}. Skipping this result. Full traceback:\n{traceback.format_exc()}")
+            except Exception as e:
+                logger.error(f"{async_name} -> General Error processing search result {i+1} for keyword '{keyword}': {str(e)}\n{traceback.format_exc()}")
 
 
-# --- 主入口 ---
-all_search_results_data = []
-data_lock = asyncio.Lock()
-# Note: processed_image_detail_urls is now declared inside performCivitaiImageScrape
-# if you need to track across multiple performCivitaiImageScrape calls,
-# you might consider moving it to a global level or passing it as a parameter
-# to avoid re-initializing per scrape task. For now, it's reset per target_url.
+    except playwright_api.TimeoutError:
+        logger.error(f"{async_name} -> Error: No search results (div.eA0Zlc) found on page for keyword '{keyword}' within timeout.")
+    except Exception as e:
+        logger.error(f"{async_name} -> An unexpected error occurred during search results processing for keyword '{keyword}': {e}\n{traceback.format_exc()}")
+
+
+    await page.close() # Close the Playwright page
+    logger.info(f"{async_name} -> Page closed for keyword: '{keyword}'.")
+
 
 async def main():
+    # Load download history at the start of the script to enable deduplication
     load_download_history(DOWNLOAD_HISTORY_FILE)
-    load_url_history(HISTORY_IMG_URL_FILE) # Load the new URL-based history
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            headless=False,
-            proxy={"server": PROXY} if PROXY else None,
-            timeout=60000
+            headless=False, # Set to True for headless Browse (runs without a visible browser window)
+            proxy={"server": PROXY} if PROXY else None, # Configure proxy for the Playwright browser
+            timeout=60000 # Browser launch timeout (in milliseconds)
         )
+        # Set browser window size
         context = await browser.new_context(
             viewport={'width': 2560, 'height': 1440}
-        )
-        target_urls = read_urls_from_file(KEYWORD_TARGET_FILE)
-        if not target_urls:
-            logger.error(f"No valid URLs found in {KEYWORD_TARGET_FILE}. Please add URLs to scrape.")
+        ) # Create a new browser context with specified viewport size
+
+        # --- Optimized section for reading Keywords from file ---
+        target_keywords = read_keywords_from_file(KEYWORD_TARGET_FILE)
+        if not target_keywords:
+            logger.error(f"No valid keywords found in {KEYWORD_TARGET_FILE}. Exiting scraper.")
             await browser.close()
-            return
-        # 直接抓取所有URL
-        tasks = [performCivitaiImageScrape(context, url) for url in target_urls]
+            return # Exit main if no keywords to scrape
+
+        # Create a list of tasks for each keyword
+        # Call the renamed function here
+        tasks = [performGoogleImageSearch(context, keyword) for keyword in target_keywords]
+
+        # Run all scraping tasks concurrently
         await asyncio.gather(*tasks)
-        await browser.close()
+        # --- End optimized section ---
+
+        await browser.close() # Close the browser instance after all tasks are done
         logger.info("Browser closed. Script finished scraping data.")
 
-    # --- Excel 导出 ---
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Civitai图片结果"
-    headers = ["抓取时间", "搜索URL", "缩略图URL", "本地缩略图路径", "本地缩略图超链接", "原始图片详情页链接", "点赞数", "爱心数", "笑哭数", "伤心数", "打赏数", "关键词"]
-    ws.append(headers)
+    # --- Excel Export Logic (This block will always run after scraping attempts complete) ---
+    wb = Workbook() # Create a new Excel workbook
+
+    # --- Sheet 1: Google图片搜索结果 (Google Image Search Results) ---
+    ws = wb.active # Get the active worksheet (the first one created by default)
+    ws.title = "Google图片搜索结果" # Set the title of the active sheet
+
+    # Define headers for the image search results sheet
+    headers = ["抓取时间", "搜索关键词", "搜索URL", "图片URL", "本地图片路径", "本地图片超链接", "搜索结果标题", "搜索结果标题链接", "搜索结果描述"]
+    ws.append(headers) # Write headers to the first row of the sheet
+
+    # Define font style for hyperlinks (blue, underlined)
     hyperlink_font = Font(color="0000FF", underline="single")
+
+    # Populate the sheet with collected search results data
     for row_data in all_search_results_data:
         row = []
         for header in headers:
-            if header == "本地缩略图超链接":
-                row.append("点击打开缩略图")
-            else:
-                row.append(row_data.get(header, ""))
-        ws.append(row)
-        current_row_idx = ws.max_row
+            # Append data from the dictionary, using an empty string if a key is not found
+            row.append(row_data.get(header, ""))
+        ws.append(row) # Add the row to the worksheet
+
+        current_row_idx = ws.max_row # Get the current row index for applying hyperlinks
+
+        # Apply hyperlink for "搜索URL" (Search URL)
         search_url = row_data.get("搜索URL")
         if search_url:
             cell_search_url = ws.cell(row=current_row_idx, column=headers.index("搜索URL") + 1)
             cell_search_url.value = search_url
             cell_search_url.hyperlink = search_url
             cell_search_url.font = hyperlink_font
-        thumbnail_url = row_data.get("缩略图URL")
-        if thumbnail_url:
-            cell_thumbnail_url = ws.cell(row=current_row_idx, column=headers.index("缩略图URL") + 1)
-            cell_thumbnail_url.value = thumbnail_url
-            cell_thumbnail_url.hyperlink = thumbnail_url
-            cell_thumbnail_url.font = hyperlink_font
-        local_image_hyperlink_url = row_data.get("本地缩略图超链接")
-        if local_image_hyperlink_url:
-            cell_local_image_hyperlink = ws.cell(row=current_row_idx, column=headers.index("本地缩略图超链接") + 1)
-            cell_local_image_hyperlink.value = "点击打开缩略图"
-            cell_local_image_hyperlink.hyperlink = Hyperlink(ref=local_image_hyperlink_url)
+
+        # Apply hyperlink for "图片URL" (Image URL)
+        image_url = row_data.get("图片URL")
+        if image_url:
+            cell_image_url = ws.cell(row=current_row_idx, column=headers.index("图片URL") + 1)
+            cell_image_url.value = image_url
+            cell_image_url.hyperlink = image_url
+            cell_image_url.font = hyperlink_font
+
+        # Apply hyperlink for "本地图片超链接" (Local Image Hyperlink)
+        local_image_hyperlink = row_data.get("本地图片超链接")
+        if local_image_hyperlink:
+            cell_local_image_hyperlink = ws.cell(row=current_row_idx, column=headers.index("本地图片超链接") + 1)
+            # Display text for the hyperlink will be the local path, but the actual hyperlink is the file:// one
+            cell_local_image_hyperlink.value = row_data.get("本地图片路径", "")
+            cell_local_image_hyperlink.hyperlink = local_image_hyperlink
             cell_local_image_hyperlink.font = hyperlink_font
-        original_page_link = row_data.get("原始图片详情页链接")
-        if original_page_link:
-            cell_original_page_link = ws.cell(row=current_row_idx, column=headers.index("原始图片详情页链接") + 1)
-            cell_original_page_link.value = original_page_link
-            cell_original_page_link.hyperlink = original_page_link
-            cell_original_page_link.font = hyperlink_font
+
+
+        # Apply hyperlink for "搜索结果标题链接" (Search Result Title Link)
+        title_link = row_data.get("搜索结果标题链接")
+        if title_link:
+            cell_title_link = ws.cell(row=current_row_idx, column=headers.index("搜索结果标题链接") + 1)
+            cell_title_link.value = title_link
+            cell_title_link.hyperlink = title_link
+            cell_title_link.font = hyperlink_font
+
+    # Adjust column widths for the sheet for better readability
     for col_idx, header in enumerate(headers):
-        max_length = len(header)
-        column_letter = get_column_letter(col_idx + 1)
-        for r_idx in range(1, ws.max_row + 1):
-            cell_value = ws.cell(row=r_idx, column=col_idx + 1).value
-            if cell_value:
-                cell_len = len(str(cell_value))
-                if cell_len > max_length:
-                    max_length = cell_len
-            adjusted_width = (max_length + 2) * 1.2
-            if adjusted_width > 100:
-                adjusted_width = 100
-            ws.column_dimensions[column_letter].width = adjusted_width
-    wb.save(excel_filename)
+        max_length = len(header) # Initialize max length with header's length
+        column_letter = get_column_letter(col_idx + 1) # Get Excel column letter (e.g., 'A', 'B', 'C'...)
+        # Iterate over all cells in the column to find the maximum content length
+        for cell in ws[column_letter]:
+            try:
+                if cell.value:
+                    cell_len = len(str(cell.value))
+                    if cell_len > max_length:
+                        max_length = cell_len
+            except TypeError:
+                pass # Ignore non-string types (e.g., numbers, None)
+
+        adjusted_width = (max_length + 2) * 1.2 # Add padding and a factor for better visual spacing
+        if adjusted_width > 100: # Cap maximum column width to prevent excessively wide columns
+            adjusted_width = 100
+        ws.column_dimensions[column_letter].width = adjusted_width # Set the adjusted column width
+
+    wb.save(excel_filename) # Save the entire workbook to the timestamped Excel file
     logger.info(f"Results saved to Excel: {excel_filename}")
+    # --- END Excel Export Logic ---
+
+    # Save download history at the end of the script for persistence
     save_download_history(DOWNLOAD_HISTORY_FILE)
-    save_url_history(HISTORY_IMG_URL_FILE) # Save the new URL-based history
+
 
 if __name__ == '__main__':
+    # Store handlers to close them properly later
+    # This list must be created BEFORE any handlers are added to the logger
+    # so we have a reference to the handlers created during global setup.
+    global_handlers = []
+    # This loop is problematic because the handlers are added *after* the logger.handlers list is empty initially.
+    # The proper way to get the handlers is to access logger.handlers AFTER they've been added.
+    # Instead, we will store them explicitly when they are created.
+
     try:
+        # Run the main asynchronous function
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Script interrupted by user.")
+        logger.info("Script interrupted by user.") # Log if script is interrupted by user (Ctrl+C)
     except Exception as e:
-        logger.critical(f"An unhandled error occurred in main: {e}\n{traceback.format_exc()}")
+        logger.critical(f"An unhandled error occurred in main: {e}\n{traceback.format_exc()}") # Log any unhandled critical errors
     finally:
-        for handler in logger.handlers[:]:
+        # This 'finally' block ensures cleanup and file opening actions always happen
+
+        # Before opening files, ensure the log handlers are flushed and closed.
+        # It's crucial to do this *after* all logging is done.
+        for handler in logger.handlers[:]: # Iterate over a slice to safely modify list while iterating
             try:
                 handler.flush()
                 handler.close()
                 logger.removeHandler(handler)
             except Exception as e:
-                print(f"Error closing log handler: {e}")
+                print(f"Error closing log handler: {e}") # Use print here as logger might be closed
+
+        # Automatically open the log file for review
         try:
             if os.path.exists(log_filename):
                 print(f"Attempting to open log file: {log_filename}")
-                if os.name == 'nt':
+                if os.name == 'nt':  # Check if OS is Windows
                     os.startfile(log_filename)
-                elif hasattr(os, "uname") and os.uname().sysname == 'Darwin':
+                elif os.uname().sysname == 'Darwin':  # Check if OS is macOS
                     subprocess.run(['open', log_filename])
-                else:
-                    subprocess.run(['xdg-open', log_filename])
+                else:  # Assume Linux-like system
+                    subprocess.run(['xdg-open', log_filename]) # Common command for opening files on Linux
             else:
                 print(f"Log file not found: {log_filename}")
         except Exception as e:
             print(f"Error opening log file {log_filename}: {e}")
+
+        # Automatically open the Excel file for review
         try:
             if os.path.exists(excel_filename):
                 print(f"Attempting to open Excel file: {excel_filename}")
-                if os.name == 'nt':
+                if os.name == 'nt':  # Windows
                     os.startfile(excel_filename)
-                elif hasattr(os, "uname") and os.uname().sysname == 'Darwin':
+                elif os.uname().sysname == 'Darwin':  # macOS
                     subprocess.run(['open', excel_filename])
-                else:
+                else:  # Linux
                     subprocess.run(['xdg-open', excel_filename])
             else:
                 print(f"Excel file not found: {excel_filename}")
         except Exception as e:
             print(f"Error opening Excel file {excel_filename}: {e}")
-        try:
-            if os.path.exists(HISTORY_IMG_URL_FILE):
-                print(f"Attempting to open URL history Excel file: {HISTORY_IMG_URL_FILE}")
-                if os.name == 'nt':
-                    os.startfile(HISTORY_IMG_URL_FILE)
-                elif hasattr(os, "uname") and os.uname().sysname == 'Darwin':
-                    subprocess.run(['open', HISTORY_IMG_URL_FILE])
-                else:
-                    subprocess.run(['xdg-open', HISTORY_IMG_URL_FILE])
-            else:
-                print(f"URL history Excel file not found: {HISTORY_IMG_URL_FILE}")
-        except Exception as e:
-            print(f"Error opening URL history Excel file {HISTORY_IMG_URL_FILE}: {e}")
-
-
-            #运行成功
